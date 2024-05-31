@@ -72,7 +72,6 @@ def prepare_kmeans_data(df, target_ports):
         if str(row['dstPort']) in target_ports:
             kmeans_df.loc[row['srcIp'], str(row['dstPort'])] = 1
         
-        # Check if the srcIp prefix matches the dstIp prefix and set P2P column
         src_prefix = '.'.join(row['srcIp'].split('.')[:2])
         dst_prefix = '.'.join(row['dstIp'].split('.')[:2])
         if src_prefix == dst_prefix:
@@ -80,68 +79,74 @@ def prepare_kmeans_data(df, target_ports):
     
 
     return kmeans_df
-def perform_kmeans_and_plot_pca(kmeans_data, num_clusters):
+def filter_by_subnet_and_threshold(data, threshold=0.07):
+    subnets = set(index.rsplit('.', 1)[0] for index in data.index)
+    filtered_data = pd.DataFrame()
+    for subnet in subnets:
+        subnet_data = data[data.index.str.startswith(subnet)]
+        if not subnet_data.empty:
+            sum_by_port = subnet_data.drop(columns='Cluster').sum(axis=0)
+            total_entries = len(subnet_data)
+            if (sum_by_port / total_entries).max() > threshold:
+                filtered_data = pd.concat([filtered_data, subnet_data])
+    return filtered_data
+    
 
-    # Perform KMeans clustering
+def perform_kmeans (kmeans_data,num_clusters):
+
     kmeans = KMeans(n_clusters=num_clusters, random_state=42, n_init=10)
     kmeans.fit(kmeans_data)
-    
-    # Add the cluster labels to the DataFrame
     kmeans_data['Cluster'] = kmeans.labels_
-    
     silhouette_avg = silhouette_score(kmeans_data.drop(columns='Cluster'), kmeans_data['Cluster'])
     db_index = davies_bouldin_score(kmeans_data.drop(columns='Cluster'), kmeans_data['Cluster'])
     print(f'K: {num_clusters}, Silhouette Score: {silhouette_avg}, Davies-Bouldin Index: {db_index}')
-    
+    return kmeans_data
+
+def filter_patterns_in_cluster(cluster):
+    threshold_percentage = 0.04
+    total_lines = len(cluster)
+    threshold_value = total_lines * threshold_percentage
+    patterns = cluster.apply(lambda row: tuple(row[:-1] == 1), axis=1)
+    pattern_counts = patterns.value_counts()
+    patterns_to_keep = pattern_counts[pattern_counts >= threshold_value].index
+    filtered_cluster = cluster[patterns.isin(patterns_to_keep)]
+    return filtered_cluster, total_lines- len(filtered_cluster)
+
+def plot_data( kmeans_data, num_clusters, with_noise):
+    # PCA
     pca = PCA(n_components=2)
     pca_result = pca.fit_transform(kmeans_data.drop(columns='Cluster'))
-    
-    # Create a DataFrame for PCA results
     pca_df = pd.DataFrame(pca_result, columns=['PCA Component 1', 'PCA Component 2'], index=kmeans_data.index)
     pca_df['Cluster'] = kmeans_data['Cluster'].astype(str)
-    
-    # Interactive PCA plot with Plotly
+    # Plotly
     fig_pca = px.scatter(pca_df, x='PCA Component 1', y='PCA Component 2', color='Cluster',
                          title=f'PCA of Clusters with K={num_clusters}')
     fig_pca.show()
-    
-    # Define colors using the updated method
+
     cmap = plt.colormaps['tab20']
     colors = [cmap(i) for i in range(num_clusters)]
-
-    # Create a figure with subplots
     fig, axes = plt.subplots(math.ceil(num_clusters / 4), 4, figsize=(15, 10))
 
     for cluster in range(num_clusters):
-        # Calculate the position in the subplot grid
         row = cluster // 4
         col = cluster % 4
-
-        # Filter the data for the specific cluster
         cluster_data = kmeans_data[kmeans_data['Cluster'] == cluster]
-
-        # Check if the cluster data is empty
         if cluster_data.empty:
             continue
-
-        # Extract the first octet from the srcIp
-        first_octet = cluster_data.index.str.split('.').str[0]
-
-        # Calculate the percentage of each unique first octet
-        first_octet_percentage = first_octet.value_counts(normalize=True) * 100
+        if with_noise==False:
+            cluster_data,dropped_data =  filter_patterns_in_cluster(cluster_data)
         
-        # Calculate the count of each unique first octet
+        first_octet = cluster_data.index.str.split('.').str[0]
+        first_octet_percentage = first_octet.value_counts(normalize=True) * 100
         first_octet_count = first_octet.value_counts()
         
-        # Generate the title based on the destination ports that have a value of 1
-       # title_ports = cluster_data.drop(columns='Cluster').columns[(cluster_data.drop(columns='Cluster').sum(axis=0) > 0)].tolist()
-        #title_ports = cluster_data.drop(columns='Cluster').sum(axis=0).sort_values(ascending=False).index.tolist()
         title_ports = cluster_data.drop(columns='Cluster').loc[:, cluster_data.drop(columns='Cluster').sum(axis=0) > 0].sum(axis=0).sort_values(ascending=False).index.tolist()
+        if with_noise:
+            title = f'Cluster {cluster}: ' + ', '.join(title_ports)
+        else:
+            title = f'Cluster {cluster}: ' + ', '.join(title_ports) + f' dropped {dropped_data*100/ len(cluster_data):.1f}'
 
-
-        title = f'Cluster {cluster}: ' + ', '.join(title_ports)
-
-        # Plot the percentages and counts using dual axes
+        # Plot 
         ax = axes[row, col]
         ax2 = ax.twinx()
         
@@ -156,6 +161,7 @@ def perform_kmeans_and_plot_pca(kmeans_data, num_clusters):
         ax2.set_ylabel('Count', fontsize=8)
         ax2.tick_params(axis='y', labelsize=8)
 
-    # Adjust layout to prevent overlap
+    
     plt.tight_layout()
     plt.show()
+    
